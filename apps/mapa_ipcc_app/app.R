@@ -2,203 +2,284 @@
 library(shiny)
 library(dplyr)
 library(ggplot2)
+library(sf)
 library(lubridate)
-library(RColorBrewer)
+library(ggrepel)
+library(leaflet)
+library(shinyWidgets)
+library(grDevices)
+library(RColorBrewer) # Nueva librería para generar paletas de colores únicas
 
 # === 2. Configuración de Rutas ===
-MATRICES_DIR <- ("..","Results", "matrices_csv")
+SOM_FILE_PATH <- ("..","Results","som_classification","som_temp_clusters.rds")
+IPCC_REGIONS_FILE <- ("..","Data","IPCC-WGI-reference-regions-v4.geojson")
+POINTS_IPCC_ASSIGNMENT_PATH <- ("..","Results","point_ipcc_assignment.csv")
+TEMP_DATA_FILE_PATH <- ("..","Data","temp_data_for_som.rds")
 
-# === 3. Carga de Datos Preprocesados (solo lo necesario) ===
-decadas_svd_avail <- c()
-all_svd_dir <- file.path(MATRICES_DIR, "Todas")
-if (dir.exists(all_svd_dir)) {
-  svd_files <- list.files(all_svd_dir, pattern = "SVD_\\d{4}s_Todas\\.rds", full.names = FALSE)
-  if (length(svd_files) > 0) { 
-    decadas_svd_avail <- sort(as.numeric(gsub("SVD_(\\d{4})s_Todas\\.rds", "\\1", svd_files)))
-  }
+# === 3. Cargar Datos y Modelos ===
+if (!file.exists(IPCC_REGIONS_FILE)) {
+  stop("ERROR: El archivo GeoJSON de regiones IPCC no se encontró en la ruta especificada. Revise la ruta.")
+}
+if (!file.exists(SOM_FILE_PATH)) {
+  stop("ERROR: El archivo .rds de resultados SOM no se encontró. Revise la ruta.")
+}
+if (!file.exists(TEMP_DATA_FILE_PATH)) {
+  stop("ERROR: El archivo de datos de temperatura 'temp_data_for_som.rds' no se encontró. Por favor, ejecute el script de pre-procesamiento del paso 1.")
 }
 
-# === UI de Shiny ===
+temp_data_from_rds <- readRDS(TEMP_DATA_FILE_PATH)
+temp_data_full <- temp_data_from_rds$temp_data
+time_var_raw <- temp_data_from_rds$time_var
+
+reference_date_start <- as.Date("1850-01-01")
+dates_global <- seq(from = reference_date_start, by = "month", length.out = length(time_var_raw))
+
+som_results_df <- readRDS(SOM_FILE_PATH)
+if (is.null(som_results_df) || nrow(som_results_df) == 0) {
+  stop("ERROR: Los datos SOM son NULL o están vacíos.")
+}
+som_results_df$original_idx <- 1:nrow(som_results_df)
+
+ipcc_regions_sf <- tryCatch({
+  st_read(IPCC_REGIONS_FILE, quiet = TRUE) %>%
+    st_transform(4326)
+}, error = function(e) {
+  message("Error al cargar o transformar el archivo GeoJSON de regiones IPCC: ", e$message)
+  NULL
+})
+
+if (!file.exists(POINTS_IPCC_ASSIGNMENT_PATH)) {
+  points_ipcc_assignment <- data.frame(
+    lon = som_results_df$lon,
+    lat = som_results_df$lat,
+    original_idx = som_results_df$original_idx,
+    ipcc_region_name = NA_character_
+  )
+  if (!is.null(ipcc_regions_sf) && nrow(ipcc_regions_sf) > 0) {
+    global_points_sf <- st_as_sf(points_ipcc_assignment, coords = c("lon", "lat"), crs = 4326)
+    intersections <- st_intersects(global_points_sf, ipcc_regions_sf)
+    for (i in 1:length(intersections)) {
+      if (length(intersections[[i]]) > 0) {
+        points_ipcc_assignment$ipcc_region_name[i] <- ipcc_regions_sf$Name[intersections[[i]][1]]
+      } else {
+        points_ipcc_assignment$ipcc_region_name[i] <- "No Definido"
+      }
+    }
+  } else {
+    points_ipcc_assignment$ipcc_region_name <- "No Definido"
+  }
+  write.csv(points_ipcc_assignment, POINTS_IPCC_ASSIGNMENT_PATH, row.names = FALSE)
+} else {
+  points_ipcc_assignment <- read.csv(POINTS_IPCC_ASSIGNMENT_PATH)
+}
+
+som_data_full_app <- som_results_df %>%
+  left_join(points_ipcc_assignment %>% select(original_idx, ipcc_region_name), by = "original_idx")
+
+som_group_ipcc_summary <- som_data_full_app %>%
+  filter(!is.na(som_group_id), !is.na(ipcc_region_name), ipcc_region_name != "No Definido") %>%
+  group_by(som_group_id, ipcc_region_name) %>%
+  summarise(count = n(), .groups = 'drop') %>%
+  group_by(som_group_id) %>%
+  arrange(desc(count)) %>%
+  slice(1) %>%
+  ungroup() %>%
+  mutate(display_name = paste0("Grupo ", som_group_id, " (", ipcc_region_name, ")"))
+
+all_som_groups <- unique(som_results_df$som_group_id) %>% sort()
+som_group_ipcc_map <- som_group_ipcc_summary %>% arrange(som_group_id)
+
+# === CORRECCIÓN EN LA PALETA DE COLORES ===
+num_clusters <- length(all_som_groups)
+if (num_clusters > 0) {
+ 
+  full_palette <- colorRampPalette(brewer.pal(11, "Spectral"))(num_clusters)
+  som_color_palette <- setNames(full_palette, as.character(all_som_groups)) 
+} else {
+  som_color_palette <- setNames(character(), character()) 
+}
+
+# === 4. Interfaz de Usuario (UI) ===
 ui <- fluidPage(
-  titlePanel("Análisis de Componentes Principales (SVD)"),
+  titlePanel("Análisis Regional de Clusters SOM y Regiones IPCC"),
   sidebarLayout(
     sidebarPanel(
-      selectInput("decada", "Década:",
-                  choices = as.character(decadas_svd_avail),
-                  selected = if(length(decadas_svd_avail) > 0) as.character(max(decadas_svd_avail)) else NULL),
-      
-      h4("Análisis de Matriz Específica (U, V, D)"),
-      selectInput("matriz_seleccionada", "Seleccionar Matriz:",
-                  choices = c("U (Modo Espacial)" = "U", "V (Modo Temporal)" = "V", "D (Valor Singular)" = "D"),
-                  selected = "U"),
-      
-      uiOutput("temporal_mode_controls"),
-      uiOutput("indice_input"),
-      h4("Valor del Punto Seleccionado:"),
-      textOutput("valor_punto_seleccionado"),
+      uiOutput("som_ts_group_selector"),
+      uiOutput("ipcc_region_selector"),
+      tags$hr(),
+      uiOutput("ipcc_map_options"),
       width = 3
     ),
     mainPanel(
       tabsetPanel(id = "main_tabs",
-                  tabPanel("Scree Plot Log-Log", plotOutput("scree_plot", height = "500px")),
-                  tabPanel("Análisis Temporal/Global", plotOutput("temporal_global_plot", height = "600px"))
+                  tabPanel("Serie de Tiempo Grupo SOM",
+                           plotOutput("som_group_timeseries_plot", height = "500px")),
+                  tabPanel("Mapa 2D de Regiones IPCC",
+                           tags$p("Este mapa muestra las regiones de referencia del IPCC con interactividad de zoom."),
+                           leafletOutput("ipcc_regions_map_leaflet", height = "600px"))
       )
     )
   )
 )
 
-# === Server de Shiny ===
+# === 5. Servidor (Server) ===
 server <- function(input, output, session) {
   
-  svd_objeto_reactivo <- reactive({
-    req(input$decada)
-    nombre_carpeta_zona <- "Todas"
-    ruta_svd_completo <- file.path(MATRICES_DIR, nombre_carpeta_zona, paste0("SVD_", input$decada, "s_", nombre_carpeta_zona, ".rds"))
-    if (file.exists(ruta_svd_completo)) {
-      readRDS(ruta_svd_completo)
-    } else {
-      NULL
-    }
+  som_data_reactive <- reactive({
+    req(som_results_df)
+    som_results_df
   })
   
-  # --- Renderizar el Scree Plot Log-Log ---
-  output$scree_plot <- renderPlot({
-    svd_data <- svd_objeto_reactivo()
-    req(svd_data)
-    valores_singulares <- svd_data$d
-    df_scree <- data.frame(id = 1:length(valores_singulares), sv = valores_singulares) %>%
-      dplyr::filter(sv > 0 & !is.na(sv))
-    
-    if(nrow(df_scree) == 0) { return(NULL) }
-    
-    zona_label <- "Global"
-    ggplot(df_scree, aes(x = log10(id), y = log10(sv))) +
-      geom_point(color = "darkred", size = 3, alpha = 0.7) +
-      geom_line(color = "red", linetype = "dashed", alpha = 0.5) +
-      labs(title = paste("Scree Plot (Log-Log) para la Década de", input$decada, "en la Zona", zona_label),
-           x = "Log10 (Orden del Componente)",
-           y = "Log10 (Valor Singular)") +
+  output$ipcc_region_selector <- renderUI({
+    req(!is.null(points_ipcc_assignment))
+    ipcc_choices <- c("Todas las Regiones" = "all", sort(unique(points_ipcc_assignment$ipcc_region_name)))
+    selectInput("ipcc_region_filter", "Región IPCC (para SOM TS):",
+                choices = ipcc_choices, selected = "all")
+  })
+  
+  output$som_ts_group_selector <- renderUI({
+    som_data_local <- som_data_reactive()
+    req(som_data_local)
+    som_cluster_choices_map <- setNames(as.character(som_group_ipcc_map$som_group_id), som_group_ipcc_map$display_name)
+    selectInput("som_ts_group_select", "Grupo SOM:",
+                choices = som_cluster_choices_map,
+                selected = if(length(som_cluster_choices_map) > 0) som_cluster_choices_map[1] else NULL)
+  })
+  
+  output$ipcc_map_options <- renderUI({
+    tagList(
+      selectInput("ipcc_map_display_type", "Mostrar en el mapa:",
+                  choices = c("Solo Regiones IPCC" = "regions_only",
+                              "Regiones IPCC con Puntos SOM" = "regions_som_points"),
+                  selected = "regions_only"),
+      conditionalPanel(
+        condition = "input.ipcc_map_display_type == 'regions_som_points'",
+        selectInput("ipcc_map_som_filter", "Resaltar Grupo SOM (en 2D):",
+                    choices = c("Todos" = "all",
+                                setNames(as.character(som_group_ipcc_map$som_group_id),
+                                         som_group_ipcc_map$display_name)),
+                    selected = "all")
+      )
+    )
+  })
+  
+  som_color_palette_proxy <- reactive({
+    som_color_palette
+  })
+  
+  output$som_group_timeseries_plot <- renderPlot({
+    req(input$main_tabs == "Serie de Tiempo Grupo SOM")
+    req(!is.null(som_results_df))
+    req(!is.null(input$som_ts_group_select))
+    req(!is.null(input$ipcc_region_filter))
+    selected_som_group <- as.numeric(input$som_ts_group_select)
+    selected_ipcc_region <- input$ipcc_region_filter
+    combined_som_ipcc_data <- som_data_full_app %>%
+      filter(som_group_id == selected_som_group)
+    if (selected_ipcc_region != "all") {
+      combined_som_ipcc_data <- combined_som_ipcc_data %>%
+        filter(ipcc_region_name == selected_ipcc_region)
+    }
+    if (nrow(combined_som_ipcc_data) == 0) {
+      feedback_message <- paste("No hay puntos para el Grupo SOM", selected_som_group)
+      if (selected_ipcc_region != "all") {
+        feedback_message <- paste0(feedback_message, " en la región IPCC: ", selected_ipcc_region)
+      }
+      feedback_message <- paste0(feedback_message, ".\nEsto puede significar que no hay puntos en el grupo SOM que también pertenezcan a la región IPCC seleccionada, o que no hay datos disponibles para esta combinación.")
+      return(ggplot() + annotate("text", x = 0.5, y = 0.5, label = feedback_message, size = 5, color = "darkgrey"))
+    }
+    valid_original_idx_to_extract <- combined_som_ipcc_data$original_idx[
+      combined_som_ipcc_data$original_idx >= 1 & combined_som_ipcc_data$original_idx <= nrow(temp_data_full)
+    ]
+    if (length(valid_original_idx_to_extract) == 0) {
+      return(ggplot() + annotate("text", x = 0.5, y = 0.5, label = "No se encontraron datos de temperatura para los puntos seleccionados del grupo SOM y la región IPCC.", size = 5, color = "darkgrey"))
+    }
+    temp_series_for_group <- temp_data_full[valid_original_idx_to_extract, , drop = FALSE]
+    if (nrow(temp_series_for_group) == 0 || all(is.na(temp_series_for_group))) {
+      return(ggplot() + annotate("text", x = 0.5, y = 0.5, label = "Datos de temperatura no disponibles o solo NA para los puntos seleccionados.", size = 5, color = "darkgrey"))
+    }
+    avg_temp_series <- apply(temp_series_for_group, 2, mean, na.rm = TRUE)
+    if (all(is.na(avg_temp_series)) || all(is.nan(avg_temp_series))) {
+      return(ggplot() + annotate("text", x = 0.5, y = 0.5, label = "Serie de tiempo promedio vacía o con solo valores faltantes después de promediar.", size = 5, color = "darkgrey"))
+    }
+    if (length(dates_global) != length(avg_temp_series)) {
+      return(ggplot() + annotate("text", x = 0.5, y = 0.5, label = "Error en la longitud de las fechas y la serie de tiempo promediada. Revise la indexación de los datos.", size = 5, color = "red"))
+    }
+    df_timeseries <- data.frame(
+      Date = dates_global,
+      Temperature = avg_temp_series
+    ) %>%
+      filter(!is.na(Temperature))
+    if (nrow(df_timeseries) == 0) {
+      return(ggplot() + annotate("text", x = 0.5, y = 0.5, label = "No hay datos de temperatura válidos para este grupo después de promediar y filtrar NA.", size = 5, color = "darkgrey"))
+    }
+    som_group_display_name <- som_group_ipcc_map$display_name[som_group_ipcc_map$som_group_id == selected_som_group]
+    if (length(som_group_display_name) == 0) {
+      som_group_display_name <- paste0("Grupo ", selected_som_group, " (Nombre Desconocido)")
+    }
+    ggplot(df_timeseries, aes(x = Date, y = Temperature)) +
+      geom_line(color = "steelblue", size = 1) +
+      geom_smooth(method = "loess", se = FALSE, color = "red", linetype = "dashed") +
+      labs(
+        title = paste("Serie de Tiempo de Temperatura Promedio para", som_group_display_name,
+                      "\n(Filtrado por Región IPCC:", selected_ipcc_region, ")"),
+        x = "Fecha",
+        y = "Temperatura Promedio (°C)"
+      ) +
       theme_minimal() +
       theme(plot.title = element_text(hjust = 0.5))
   })
   
-  # --- Control para seleccionar el modo en el análisis temporal ---
-  output$temporal_mode_controls <- renderUI({
-    req(input$matriz_seleccionada)
-    if (input$matriz_seleccionada == "V") {
-      tagList(
-        sliderInput("v_mode_selection", "Modo Temporal (columna de V):",
-                    min = 1, max = 50, value = 1, step = 1)
+  output$ipcc_regions_map_leaflet <- renderLeaflet({
+    req(!is.null(ipcc_regions_sf))
+    leaflet(ipcc_regions_sf) %>%
+      setView(lng = -10, lat = 0, zoom = 2) %>%
+      addTiles() %>%
+      addPolygons(
+        fillColor = "lightblue",
+        color = "black",
+        weight = 1,
+        opacity = 1,
+        fillOpacity = 0.5,
+        label = ~Name,
+        highlightOptions = highlightOptions(color = "red", weight = 3, bringToFront = TRUE)
       )
-    }
   })
   
-  # --- Gráfico para Análisis Temporal/Global ---
-  output$temporal_global_plot <- renderPlot({
-    req(input$matriz_seleccionada, input$decada)
-    if (input$matriz_seleccionada == "V") {
-      req(input$v_mode_selection)
-      modo_v_seleccionado <- as.numeric(input$v_mode_selection)
-      df_v_combined <- data.frame(decade = character(), month_index = numeric(), v_value = numeric())
-      for (d in decadas_svd_avail) {
-        zona_dir_name_all <- "Todas"
-        ruta_svd_completo_v <- file.path(MATRICES_DIR, zona_dir_name_all, paste0("SVD_", d, "s_", zona_dir_name_all, ".rds"))
-        if (file.exists(ruta_svd_completo_v)) {
-          svd_data_decade <- readRDS(ruta_svd_completo_v)
-          if (!is.null(svd_data_decade$v) && modo_v_seleccionado <= ncol(svd_data_decade$v)) {
-            v_values_for_decade <- svd_data_decade$v[, modo_v_seleccionado]
-            df_v_decade <- data.frame(decade = paste0(d, "s"), month_index = 1:length(v_values_for_decade), v_value = v_values_for_decade)
-            df_v_combined <- bind_rows(df_v_combined, df_v_decade)
-          }
-        }
-      }
-      if (nrow(df_v_combined) == 0) { return(ggplot() + annotate("text", x = 0.5, y = 0.5, label = "No hay datos de Modo V para la combinación seleccionada.", size = 5)) }
-      
-      # *** CORRECCIÓN: Usar una paleta de colores dinámicamente generada para todas las décadas
-      num_decadas <- length(unique(df_v_combined$decade))
-      # Si hay más de 8 décadas, usar una paleta de viridis, sino una de RColorBrewer
-      if (num_decadas > 8) {
-        color_palette <- viridisLite::viridis(num_decadas)
-      } else {
-        color_palette <- brewer.pal(max(3, num_decadas), "Paired")
-      }
-      
-      ggplot(df_v_combined, aes(x = month_index, y = v_value, color = decade, group = decade)) +
-        geom_line() + geom_point(alpha = 0.7) +
-        labs(title = paste("Modo Temporal (V) ", modo_v_seleccionado, " a través de las décadas"),
-             x = "Índice de Tiempo (dentro de cada década)",
-             y = "Valor del Modo V") +
-        theme_minimal() +
-        theme(plot.title = element_text(hjust = 0.5)) +
-        scale_color_manual(values = setNames(color_palette, sort(unique(df_v_combined$decade))))
-      
-    } else if (input$matriz_seleccionada == "D") {
-      df_d_combined <- data.frame(decade = character(), mode_id = numeric(), singular_value = numeric())
-      for (d in decadas_svd_avail) {
-        zona_dir_name_all <- "Todas"
-        ruta_svd_completo_d <- file.path(MATRICES_DIR, zona_dir_name_all, paste0("SVD_", d, "s_", zona_dir_name_all, ".rds"))
-        if (file.exists(ruta_svd_completo_d)) {
-          svd_data_decade <- readRDS(ruta_svd_completo_d)
-          if (!is.null(svd_data_decade$d)) {
-            df_d_decade <- data.frame(decade = paste0(d, "s"), mode_id = 1:length(svd_data_decade$d), singular_value = svd_data_decade$d)
-            df_d_combined <- bind_rows(df_d_combined, df_d_decade)
-          }
-        }
-      }
-      if (nrow(df_d_combined) == 0) { return(ggplot() + annotate("text", x = 0.5, y = 0.5, label = "No hay datos de Valores Singulares (D) para mostrar.", size = 5)) }
-      
-      num_decadas <- length(unique(df_d_combined$decade))
-      if (num_decadas > 8) {
-        color_palette <- viridisLite::viridis(num_decadas)
-      } else {
-        color_palette <- brewer.pal(max(3, num_decadas), "Spectral")
-      }
-      
-      ggplot(df_d_combined, aes(x = mode_id, y = singular_value, color = decade, group = decade)) +
-        geom_line() + geom_point(alpha = 0.7) +
-        scale_y_log10() +
-        labs(title = "Evolución de Valores Singulares (D) por Década",
-             x = "Modo", y = "Valor Singular (Log10)") +
-        theme_minimal() +
-        theme(plot.title = element_text(hjust = 0.5)) +
-        scale_color_manual(values = setNames(color_palette, sort(unique(df_d_combined$decade))))
-    } else {
-      ggplot() + annotate("text", x = 0.5, y = 0.5, label = "Selecciona 'V' o 'D' para ver el análisis.", size = 5)
+  observe({
+    req(input$main_tabs == "Mapa 2D de Regiones IPCC")
+    req(input$ipcc_map_display_type == 'regions_som_points',
+        !is.null(som_results_df),
+        !is.null(points_ipcc_assignment),
+        leafletProxy("ipcc_regions_map_leaflet"))
+    
+    leafletProxy("ipcc_regions_map_leaflet") %>%
+      clearMarkers()
+    
+    points_to_plot <- som_data_full_app %>%
+      filter(!is.na(lat) & !is.na(lon))
+    
+    if (!is.null(input$ipcc_map_som_filter) && input$ipcc_map_som_filter != "all") {
+      selected_som_group_map <- as.numeric(input$ipcc_map_som_filter)
+      points_to_plot <- points_to_plot %>% filter(som_group_id == selected_som_group_map)
     }
-  })
-  
-  # Lógica de punto específico (U, V, D)
-  output$indice_input <- renderUI({
-    svd_data <- svd_objeto_reactivo()
-    req(svd_data)
-    matriz_sel <- input$matriz_seleccionada
-    max_index <- switch(matriz_sel,
-                        "U" = nrow(svd_data$u),
-                        "V" = nrow(svd_data$v),
-                        "D" = length(svd_data$d))
-    if (is.null(max_index) || max_index == 0) { return(p("No hay datos disponibles para la matriz seleccionada.")) }
-    default_val <- min(1, max_index)
-    sliderInput("indice_punto", label = paste("Índice (1 a", max_index, "):"), min = 1, max = max_index, value = default_val, step = 1)
-  })
-  
-  output$valor_punto_seleccionado <- renderText({
-    svd_data <- svd_objeto_reactivo()
-    req(svd_data, input$indice_punto, input$modo)
-    matriz_sel <- input$matriz_seleccionada
-    indice <- input$indice_punto
-    modo <- as.numeric(input$modo)
-    valor <- NULL
-    if (matriz_sel %in% c("U", "V")) {
-      if (modo > length(svd_data$d)) { return("Modo fuera de rango.") }
+    
+    if (nrow(points_to_plot) > 0) {
+      points_to_plot$color_val <- som_color_palette_proxy()[as.character(points_to_plot$som_group_id)]
+      points_to_plot$color_val[is.na(points_to_plot$color_val)] <- "#D3D3D3"
+      
+      leafletProxy("ipcc_regions_map_leaflet") %>%
+        addCircleMarkers(data = points_to_plot,
+                         lng = ~lon,
+                         lat = ~lat,
+                         radius = 3,
+                         color = "black",
+                         fillColor = ~color_val,
+                         fillOpacity = 0.7,
+                         stroke = TRUE,
+                         weight = 1,
+                         popup = ~paste0("Grupo SOM: ", som_group_id))
     }
-    if (matriz_sel == "U") {
-      if (indice <= nrow(svd_data$u) && modo <= ncol(svd_data$u)) { valor <- svd_data$u[indice, modo] } else { return("Índice o Modo fuera de rango para U.") }
-    } else if (matriz_sel == "V") {
-      if (indice <= nrow(svd_data$v) && modo <= ncol(svd_data$v)) { valor <- svd_data$v[indice, modo] } else { return("Índice o Modo fuera de rango para V.") }
-    } else if (matriz_sel == "D") {
-      if (indice <= length(svd_data$d)) { valor <- svd_data$d[indice] } else { return("Índice fuera de rango para D.") }
-    }
-    if (!is.null(valor) && is.finite(valor)) { return(paste0(round(valor, 6))) } else { return("N/A") }
   })
 }
 
